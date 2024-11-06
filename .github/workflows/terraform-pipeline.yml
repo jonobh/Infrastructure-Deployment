@@ -1,0 +1,31 @@
+name: Terraform Pipeline
+
+# Define triggers for pipeline execution
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Special permissions required for OIDC authentication
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # Execute Terraform Plan/Apply for Dev Env
+  Terraform-Dev:
+    uses: ./.github/workflows/terraform-template.yml
+    with:
+      environment: Dev
+
+  # Execute Terraform Plan/Apply for Prod Env
+  Terraform-Prod:
+    needs: [Terraform-Dev]
+    uses: ./.github/workflows/terraform-template.yml
+    with:
+      environment: Prod

@@ -1,0 +1,142 @@
+name: 'Terraform Template'
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+jobs:
+  terraform-plan:
+    name: 'Terraform Plan'
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: "${{ vars.AZURE_CLIENT_ID }}"
+      ARM_SUBSCRIPTION_ID: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+      ARM_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
+      ARM_USE_OIDC: "true"
+      ENVIRONMENT: "${{ inputs.environment }}"
+    outputs:
+      tfplanExitCode: ${{ steps.tf-plan.outputs.exitcode }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init with Backend Config
+        working-directory: Terraform
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT_NAME }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER_NAME }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP_NAME }}"
+
+      - name: Terraform Plan
+        id: tf-plan
+        working-directory: Terraform
+        run: |
+          export exitcode=0
+
+          terraform ${{ vars.TERRAFORM_PLAN_MODE }} -detailed-exitcode -var-file="$ENVIRONMENT.tfvars" -no-color -out=tfplan || exitcode=$?
+          echo "exitcode=$exitcode" >> $GITHUB_OUTPUT
+
+          if [ $exitcode -eq 1 ]; then
+            echo Terraform Plan Failed!
+            exit 1
+          else 
+            exit 0
+          fi
+
+      - name: Rename tfplan to upload a unique artifact 
+        working-directory: Terraform
+        run: cp tfplan tfplan${{ inputs.environment }}
+
+      - name: Publish Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan${{ inputs.environment }}
+          path: Terraform/tfplan${{ inputs.environment }}
+
+      - name: Create String Output
+        id: tf-plan-string
+        working-directory: Terraform
+        run: |
+          TERRAFORM_PLAN=$(terraform show -no-color tfplan)
+          delimiter="$(openssl rand -hex 8)"
+          echo "summary<<${delimiter}" >> $GITHUB_OUTPUT
+          echo "## ${{ inputs.environment }} Terraform Plan Output" >> $GITHUB_OUTPUT
+          echo "<details><summary>Click to expand</summary>" >> $GITHUB_OUTPUT
+          echo "$TERRAFORM_PLAN" >> $GITHUB_OUTPUT
+          echo "${delimiter}" >> $GITHUB_OUTPUT
+
+      - name: Publish Terraform Plan to Task Summary
+        env:
+          SUMMARY: ${{ steps.tf-plan-string.outputs.summary }}
+        run: |
+          echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+
+      - name: Push Terraform Output to PR
+        if: github.ref != 'refs/heads/main'
+        uses: actions/github-script@v7
+        env:
+          SUMMARY: "${{ steps.tf-plan-string.outputs.summary }}"
+        with:
+            github-token: ${{ secrets.GITHUB_TOKEN }}
+            script: |
+              const body = `${process.env.SUMMARY}`;
+              github.rest.issues.createComment({
+                  issue_number: context.issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: body
+              })
+
+  terraform-apply:
+    name: 'Terraform Apply' 
+    if: github.ref == 'refs/heads/main' && needs.terraform-plan.outputs.tfplanExitCode == 2
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: [terraform-plan]
+    env:
+      ARM_CLIENT_ID: "${{ vars.AZURE_CLIENT_ID }}"
+      ARM_SUBSCRIPTION_ID: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+      ARM_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
+      ARM_USE_OIDC: "true"
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init with Backend Config
+        working-directory: Terraform
+        run: |
+            terraform init \
+              -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT_NAME }}" \
+              -backend-config="container_name=${{ vars.TF_STATE_CONTAINER_NAME }}" \
+              -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+              -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP_NAME }}"
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan${{ inputs.environment }}
+          path: Terraform
+
+      - name: Rename tfplan to upload a unique artifact
+        working-directory: Terraform
+        run: mv tfplan${{ inputs.environment }} tfplan
+
+      - name: Terraform Apply
+        working-directory: Terraform
+        run: terraform apply -auto-approve tfplan
